@@ -36,8 +36,8 @@ DEFINE_string(planning_data_dir, "/apollo/modules/planning/data/",
 DEFINE_int32(planning_freq, 10, "frequence of planning message");
 DEFINE_int32(learning_data_frame_num_per_file, 100,
              "number of learning_data_frame to write out in one data file.");
-DEFINE_int32(learning_data_obstacle_history_point_cnt, 20,
-             "number of history trajectory points for a obstacle");
+DEFINE_int32(learning_data_obstacle_history_time_sec, 3.0,
+             "time sec (second) of history trajectory points for a obstacle");
 DEFINE_bool(enable_binary_learning_data, true,
             "True to generate protobuf binary data file.");
 DEFINE_bool(enable_overlap_tag, true,
@@ -114,6 +114,17 @@ void FeatureGenerator::WriteOutLearningData(
   ++learning_data_file_index_;
 }
 
+void FeatureGenerator::WriteRemainderData() {
+  if (learning_data_.learning_data_size() > 0) {
+    WriteOutLearningData(learning_data_, learning_data_file_index_);
+  }
+  std::ostringstream msg;
+  msg << "record_file[" << record_file_name_
+      << "] frame_num[" << total_learning_data_frame_num_ << "]";
+  AINFO << msg.str();
+  log_file_ << msg.str() << std::endl;
+}
+
 void FeatureGenerator::OnLocalization(const LocalizationEstimate& le) {
   static double last_localization_message_timestamp_sec = 0.0;
   if (last_localization_message_timestamp_sec == 0.0) {
@@ -123,7 +134,7 @@ void FeatureGenerator::OnLocalization(const LocalizationEstimate& le) {
       le.header().timestamp_sec() - last_localization_message_timestamp_sec;
   if (time_diff < 1.0 / FLAGS_planning_freq) {
     return;
-  } else if (time_diff >= 1.0 / FLAGS_planning_freq * 2) {
+  } else if (time_diff >= (1.0 * 2 / FLAGS_planning_freq)) {
     std::ostringstream msg;
     msg << "missing localization too long: time_stamp["
         << le.header().timestamp_sec()
@@ -134,9 +145,6 @@ void FeatureGenerator::OnLocalization(const LocalizationEstimate& le) {
   last_localization_message_timestamp_sec = le.header().timestamp_sec();
   localizations_.push_back(le);
 
-  // generate one frame data
-  GenerateLearningDataFrame();
-
   while (!localizations_.empty()) {
     if (localizations_.back().header().timestamp_sec() -
         localizations_.front().header().timestamp_sec()
@@ -145,6 +153,9 @@ void FeatureGenerator::OnLocalization(const LocalizationEstimate& le) {
     }
     localizations_.pop_front();
   }
+
+  // generate one frame data
+  GenerateLearningDataFrame();
 
   // write frames into a file
   if (learning_data_.learning_data_size() >=
@@ -214,14 +225,29 @@ void FeatureGenerator::OnPrediction(
         perception_obstale.acceleration());
 
     if (obstacle_history_map_[m.first].empty() ||
-        obstacle_trajectory_point.timestamp_sec() >
-            obstacle_history_map_[m.first].back().timestamp_sec()) {
+        obstacle_trajectory_point.timestamp_sec() -
+            obstacle_history_map_[m.first].back().timestamp_sec() > 0) {
       obstacle_history_map_[m.first].push_back(obstacle_trajectory_point);
+    } else {
+      // abnormal perception data: time_diff <= 0
+      const double time_diff = obstacle_trajectory_point.timestamp_sec() -
+          obstacle_history_map_[m.first].back().timestamp_sec();
+      std::ostringstream msg;
+      msg << "SKIP: obstacle_id[" << m.first << "] last_timestamp_sec["
+          << obstacle_history_map_[m.first].back().timestamp_sec()
+          << "] timestamp_sec[" << obstacle_trajectory_point.timestamp_sec()
+          << "] time_diff [" << time_diff << "]";
+      AERROR << msg.str();
+      log_file_ << msg.str() << std::endl;
     }
 
     auto& obstacle_history = obstacle_history_map_[m.first];
-    if (static_cast<int>(obstacle_history.size()) >
-        FLAGS_learning_data_obstacle_history_point_cnt) {
+    while (!obstacle_history.empty()) {
+      const double time_distance = obstacle_history.back().timestamp_sec() -
+          obstacle_history.front().timestamp_sec();
+      if (time_distance < FLAGS_learning_data_obstacle_history_time_sec) {
+        break;
+      }
       obstacle_history.pop_front();
     }
   }
@@ -251,7 +277,7 @@ void FeatureGenerator::OnTrafficLightDetection(
 
 void FeatureGenerator::OnRoutingResponse(
   const apollo::routing::RoutingResponse& routing_response) {
-  AINFO << "routing_response received at frame["
+  ADEBUG << "routing_response received at frame["
         << total_learning_data_frame_num_ << "]";
   routing_lane_segment_.clear();
   for (int i = 0; i < routing_response.road_size(); ++i) {
@@ -269,6 +295,8 @@ void FeatureGenerator::OnRoutingResponse(
 }
 
 int FeatureGenerator::GetADCCurrentRoutingIndex() {
+  if (localizations_.empty()) return -1;
+
   static constexpr double kRadius = 4.0;
   const auto& pose = localizations_.back().pose();
   std::vector<std::shared_ptr<const apollo::hdmap::LaneInfo>> lanes;
@@ -307,8 +335,10 @@ apollo::hdmap::LaneInfoConstPtr FeatureGenerator::GetCurrentLane(
   return nullptr;
 }
 
-void FeatureGenerator::GetADCCurrentInfo(ADCCurrentInfo* adc_curr_info) {
+int FeatureGenerator::GetADCCurrentInfo(ADCCurrentInfo* adc_curr_info) {
   CHECK_NOTNULL(adc_curr_info);
+  if (localizations_.empty()) return -1;
+
   // ADC current position / velocity / acc/ heading
   const auto& adc_cur_pose = localizations_.back().pose();
   adc_curr_info->adc_cur_position_ =
@@ -321,6 +351,7 @@ void FeatureGenerator::GetADCCurrentInfo(ADCCurrentInfo* adc_curr_info) {
       std::make_pair(adc_cur_pose.linear_acceleration().x(),
                      adc_cur_pose.linear_acceleration().y());
   adc_curr_info->adc_cur_heading_ = adc_cur_pose.heading();
+  return 1;
 }
 
 void FeatureGenerator::GenerateObstacleTrajectory(
@@ -389,11 +420,6 @@ void FeatureGenerator::GenerateObstacleTrajectory(
       polygon_point->set_y(relative_point.second);
     }
   }
-  // if (obstacle_history.size() <= 0) {
-  //  AERROR << "obstacle has no history: frame_num["
-  //         << frame_num << "] obstacle_id[" << obstacle_id
-  //         << "] size[" << obstacle_history.size() << "]";
-  // }
 }
 
 void FeatureGenerator::GenerateObstaclePrediction(
@@ -460,7 +486,14 @@ void FeatureGenerator::GenerateObstaclePrediction(
 void FeatureGenerator::GenerateObstacleFeature(
     LearningDataFrame* learning_data_frame) {
   ADCCurrentInfo adc_curr_info;
-  GetADCCurrentInfo(&adc_curr_info);
+  if (GetADCCurrentInfo(&adc_curr_info) == -1) {
+    std::ostringstream msg;
+    msg << "fail to get ADC current info: frame_num["
+        << learning_data_frame->frame_num() << "]";
+    AERROR << msg.str();
+    log_file_ << msg.str() << std::endl;
+    return;
+  }
 
   const int frame_num = learning_data_frame->frame_num();
   for (const auto& m : prediction_obstacles_map_) {
@@ -557,7 +590,6 @@ void FeatureGenerator::GenerateTrafficLightDetectionFeature(
 void FeatureGenerator::GenerateADCTrajectoryPoints(
     const std::list<LocalizationEstimate>& localizations,
     LearningDataFrame* learning_data_frame) {
-
   std::vector<LocalizationEstimate> localization_samples;
   for (const auto& le : localizations) {
     localization_samples.insert(localization_samples.begin(), le);
@@ -749,7 +781,7 @@ void FeatureGenerator::GenerateADCTrajectoryPoints(
   }
 
   // update learning data
-  if (adc_trajectory_points.size() >0) {
+  if (!adc_trajectory_points.empty()) {
     learning_data_frame->mutable_planning_tag()->set_lane_turn(
         adc_trajectory_points[0].planning_tag().lane_turn());
   }
@@ -758,7 +790,7 @@ void FeatureGenerator::GenerateADCTrajectoryPoints(
     auto adc_trajectory_point = learning_data_frame->add_adc_trajectory_point();
     adc_trajectory_point->CopyFrom(trajectory_point);
   }
-  if (adc_trajectory_points.size() <= 3) {
+  if (adc_trajectory_points.size() <= 5) {
     std::ostringstream msg;
     msg << "too few adc_trajectory_points: frame_num["
         << learning_data_frame->frame_num()
@@ -797,7 +829,6 @@ void FeatureGenerator::GenerateLearningDataFrame() {
   localization->mutable_linear_acceleration()->CopyFrom(
       pose.linear_acceleration());
   localization->mutable_angular_velocity()->CopyFrom(pose.angular_velocity());
-
 
   // add traffic_light
   GenerateTrafficLightDetectionFeature(learning_data_frame);

@@ -43,6 +43,8 @@ class FeatureGenerator {
 
   void ProcessOfflineData(const std::string& record_filename);
 
+  void WriteRemainderData();
+
  private:
   struct ADCCurrentInfo {
     std::pair<double, double> adc_cur_position_;
@@ -65,7 +67,7 @@ class FeatureGenerator {
       const apollo::common::PointENU& position);
   int GetADCCurrentRoutingIndex();
 
-  void GetADCCurrentInfo(ADCCurrentInfo* adc_curr_info);
+  int GetADCCurrentInfo(ADCCurrentInfo* adc_curr_info);
 
   void GenerateObstacleTrajectory(
       const int frame_num,
